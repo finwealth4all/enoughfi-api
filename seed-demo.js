@@ -32,12 +32,27 @@ async function seed() {
     } else {
         const hash = await bcrypt.hash(DEMO_PASSWORD, 12);
         userResult = await pool.query(
-            'INSERT INTO users (email, password_hash, name, is_demo) VALUES ($1, $2, $3, true) RETURNING user_id',
+            'INSERT INTO users (email, password_hash, name, is_demo, onboarding_complete) VALUES ($1, $2, $3, true, true) RETURNING user_id',
             [DEMO_EMAIL, hash, DEMO_NAME]
         );
         userId = userResult.rows[0].user_id;
         console.log('👤 Demo user created');
     }
+
+    // Create/update financial profile for FIRE dashboard
+    try {
+        await pool.query(`DELETE FROM user_profiles WHERE user_id = $1`, [userId]);
+        await pool.query(`
+            INSERT INTO user_profiles (user_id, bank_balance, investments, property_value, retirement_funds, other_assets,
+                home_loan, credit_card_debt, other_loans, monthly_income, other_income,
+                monthly_expenses, expense_breakdown, target_retirement_age, desired_monthly_income, current_age)
+            VALUES ($1, 485000, 1250000, 5500000, 380000, 150000,
+                3200000, 8500, 0, 155000, 12000,
+                87000, $2, 45, 65000, 32)
+        `, [userId, JSON.stringify({rent:25000,groceries:12000,utilities:5000,transport:8000,dining:10000,shopping:7000,health:3000,entertainment:5000,travel:8000,other:4000})]);
+        await pool.query('UPDATE users SET onboarding_complete = true WHERE user_id = $1', [userId]);
+        console.log('📊 Financial profile created');
+    } catch(e) { console.log('Profile note:', e.message); }
 
     // Create accounts
     const accounts = [
