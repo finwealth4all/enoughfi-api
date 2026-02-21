@@ -856,6 +856,384 @@ async function createDefaultAccounts(userId) {
     }
 }
 
+// ============================================================
+// V5 ROUTES — Onboarding, FIRE Calculator, Quick Add, Ask Fi
+// ============================================================
+
+// ----- ONBOARDING -----
+app.get('/api/onboarding', authenticateToken, async (req, res) => {
+    try {
+        const profile = await pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [req.user.userId]);
+        const user = await pool.query('SELECT onboarding_complete FROM users WHERE user_id = $1', [req.user.userId]);
+        res.json({
+            complete: user.rows[0]?.onboarding_complete || false,
+            profile: profile.rows[0] || null
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/onboarding', authenticateToken, async (req, res) => {
+    try {
+        const { bank_balance, investments, property_value, retirement_funds, other_assets,
+                home_loan, credit_card_debt, other_loans,
+                monthly_income, other_income,
+                monthly_expenses, expense_breakdown,
+                target_retirement_age, desired_monthly_income, current_age } = req.body;
+
+        await pool.query(`
+            INSERT INTO user_profiles (user_id, bank_balance, investments, property_value, retirement_funds, other_assets,
+                home_loan, credit_card_debt, other_loans, monthly_income, other_income,
+                monthly_expenses, expense_breakdown, target_retirement_age, desired_monthly_income, current_age, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                bank_balance=$2, investments=$3, property_value=$4, retirement_funds=$5, other_assets=$6,
+                home_loan=$7, credit_card_debt=$8, other_loans=$9, monthly_income=$10, other_income=$11,
+                monthly_expenses=$12, expense_breakdown=$13, target_retirement_age=$14, desired_monthly_income=$15, current_age=$16, updated_at=NOW()
+        `, [req.user.userId, bank_balance||0, investments||0, property_value||0, retirement_funds||0, other_assets||0,
+            home_loan||0, credit_card_debt||0, other_loans||0, monthly_income||0, other_income||0,
+            monthly_expenses||0, JSON.stringify(expense_breakdown||{}), target_retirement_age||45, desired_monthly_income||0, current_age||30]);
+
+        await pool.query('UPDATE users SET onboarding_complete = true WHERE user_id = $1', [req.user.userId]);
+
+        // Auto-create basic accounts if user has none
+        const existingAccounts = await pool.query('SELECT COUNT(*) FROM accounts WHERE user_id = $1', [req.user.userId]);
+        if (parseInt(existingAccounts.rows[0].count) === 0) {
+            const basicAccounts = [
+                { name: 'Bank Account', type: 'Asset', sub: 'Bank', balance: bank_balance||0 },
+                { name: 'Investments', type: 'Asset', sub: 'Investment', balance: investments||0 },
+                { name: 'Property', type: 'Asset', sub: 'Fixed Asset', balance: property_value||0 },
+                { name: 'Retirement (EPF/PPF/NPS)', type: 'Asset', sub: 'Retirement', balance: retirement_funds||0 },
+                { name: 'Other Assets', type: 'Asset', sub: 'Other', balance: other_assets||0 },
+                { name: 'Home Loan', type: 'Liability', sub: 'Loan', balance: home_loan||0 },
+                { name: 'Credit Card', type: 'Liability', sub: 'Credit Card', balance: credit_card_debt||0 },
+                { name: 'Other Loans', type: 'Liability', sub: 'Loan', balance: other_loans||0 },
+                { name: 'Salary', type: 'Income', sub: 'Salary', balance: 0 },
+                { name: 'Other Income', type: 'Income', sub: 'Other', balance: 0 },
+                { name: 'Cash / Wallet', type: 'Asset', sub: 'Cash', balance: 0 },
+            ];
+            const defaultExpenseCategories = ['Rent/EMI', 'Groceries', 'Utilities', 'Transport', 'Dining Out', 'Shopping', 'Health', 'Entertainment', 'Travel', 'Other Expenses'];
+            for (const cat of defaultExpenseCategories) {
+                basicAccounts.push({ name: cat, type: 'Expense', sub: cat, balance: 0 });
+            }
+            for (const acc of basicAccounts) {
+                if (acc.type === 'Liability' && acc.balance === 0) continue;
+                try {
+                    await pool.query(`INSERT INTO accounts (user_id, account_name, account_type, sub_type, current_balance) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+                        [req.user.userId, acc.name, acc.type, acc.sub, acc.balance]);
+                } catch(e) { /* skip duplicates */ }
+            }
+        }
+
+        res.json({ success: true, message: 'Onboarding complete!' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ----- FIRE CALCULATOR -----
+app.get('/api/fire/snapshot', authenticateToken, async (req, res) => {
+    try {
+        const profile = await pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [req.user.userId]);
+        if (!profile.rows[0]) return res.json({ hasProfile: false });
+
+        const p = profile.rows[0];
+        const totalAssets = parseFloat(p.bank_balance) + parseFloat(p.investments) + parseFloat(p.property_value) + parseFloat(p.retirement_funds) + parseFloat(p.other_assets);
+        const totalDebts = parseFloat(p.home_loan) + parseFloat(p.credit_card_debt) + parseFloat(p.other_loans);
+        const netWorth = totalAssets - totalDebts;
+        const monthlyIncome = parseFloat(p.monthly_income) + parseFloat(p.other_income);
+        const monthlyExpenses = parseFloat(p.monthly_expenses);
+        const monthlySavings = monthlyIncome - monthlyExpenses;
+        const savingsRate = monthlyIncome > 0 ? (monthlySavings / monthlyIncome * 100) : 0;
+
+        const desiredAnnual = (parseFloat(p.desired_monthly_income) || monthlyExpenses * 0.7) * 12;
+        const inflationRate = 0.06;
+        const expectedReturn = 0.12;
+        const realReturn = (1 + expectedReturn) / (1 + inflationRate) - 1;
+        const fireNumber = desiredAnnual * 25;
+        const currentAge = parseInt(p.current_age) || 30;
+        const targetAge = parseInt(p.target_retirement_age) || 45;
+
+        let corpus = netWorth > 0 ? netWorth : 0;
+        let yearsToFire = 0;
+        const annualSavings = monthlySavings * 12;
+        if (annualSavings > 0) {
+            for (let y = 0; y <= 60; y++) {
+                if (corpus >= fireNumber) break;
+                corpus = corpus * (1 + realReturn) + annualSavings;
+                yearsToFire = y + 1;
+            }
+        } else {
+            yearsToFire = 999;
+        }
+
+        const projectedRetirementAge = currentAge + yearsToFire;
+        const fireProgress = fireNumber > 0 ? Math.min(100, (netWorth / fireNumber) * 100) : 0;
+        const emergencyMonths = monthlyExpenses > 0 ? (parseFloat(p.bank_balance) / monthlyExpenses) : 0;
+
+        // Try to use actual transaction data
+        let actualMonthlyExpense = monthlyExpenses;
+        try {
+            const threeMonthsAgo = new Date();
+            threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+            const recentTx = await pool.query(`
+                SELECT SUM(t.amount) as total_expense
+                FROM transactions t JOIN accounts a ON t.debit_account_id = a.account_id
+                WHERE t.user_id = $1 AND a.account_type = 'Expense' AND t.date >= $2
+            `, [req.user.userId, threeMonthsAgo.toISOString().split('T')[0]]);
+            if (recentTx.rows[0] && parseFloat(recentTx.rows[0].total_expense) > 0) {
+                actualMonthlyExpense = parseFloat(recentTx.rows[0].total_expense) / 3;
+            }
+        } catch(e) { /* use profile estimates */ }
+
+        res.json({
+            hasProfile: true, netWorth, totalAssets, totalDebts,
+            monthlyIncome, monthlyExpenses: actualMonthlyExpense,
+            monthlySavings: monthlyIncome - actualMonthlyExpense,
+            savingsRate: monthlyIncome > 0 ? ((monthlyIncome - actualMonthlyExpense) / monthlyIncome * 100) : 0,
+            fireNumber, fireProgress, projectedRetirementAge, yearsToFire,
+            targetRetirementAge: targetAge, currentAge, emergencyMonths,
+            onTrack: projectedRetirementAge <= targetAge, profile: p
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ----- FIRE IMPACT (for "Should I buy this?") -----
+app.post('/api/fire/impact', authenticateToken, async (req, res) => {
+    try {
+        const { purchaseAmount, isEMI, emiMonths } = req.body;
+        const profile = await pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [req.user.userId]);
+        if (!profile.rows[0]) return res.status(400).json({ error: 'Complete onboarding first' });
+
+        const p = profile.rows[0];
+        const monthlyIncome = parseFloat(p.monthly_income) + parseFloat(p.other_income);
+        const monthlyExpenses = parseFloat(p.monthly_expenses);
+        const monthlySavings = monthlyIncome - monthlyExpenses;
+        const totalAssets = parseFloat(p.bank_balance) + parseFloat(p.investments) + parseFloat(p.property_value) + parseFloat(p.retirement_funds) + parseFloat(p.other_assets);
+        const totalDebts = parseFloat(p.home_loan) + parseFloat(p.credit_card_debt) + parseFloat(p.other_loans);
+        const netWorth = totalAssets - totalDebts;
+        const desiredAnnual = (parseFloat(p.desired_monthly_income) || monthlyExpenses * 0.7) * 12;
+        const fireNumber = desiredAnnual * 25;
+        const realReturn = 0.0566;
+
+        const calcYearsToFire = (currentCorpus, annualSavings) => {
+            if (annualSavings <= 0) return 999;
+            let c = currentCorpus > 0 ? currentCorpus : 0;
+            for (let y = 0; y <= 60; y++) {
+                if (c >= fireNumber) return y;
+                c = c * (1 + realReturn) + annualSavings;
+            }
+            return 60;
+        };
+
+        const currentYearsToFire = calcYearsToFire(netWorth, monthlySavings * 12);
+        let newYearsToFire, monthlyEMI = 0, savingsRateAfter;
+
+        if (isEMI && emiMonths > 0) {
+            monthlyEMI = purchaseAmount / emiMonths;
+            const newMonthlySavings = monthlySavings - monthlyEMI;
+            savingsRateAfter = monthlyIncome > 0 ? (newMonthlySavings / monthlyIncome * 100) : 0;
+            let corpus = netWorth > 0 ? netWorth : 0;
+            let years = 0;
+            for (let y = 0; y <= 60; y++) {
+                if (corpus >= fireNumber) break;
+                const savings = y < (emiMonths / 12) ? newMonthlySavings * 12 : monthlySavings * 12;
+                corpus = corpus * (1 + realReturn) + savings;
+                years = y + 1;
+            }
+            newYearsToFire = years;
+        } else {
+            const newNetWorth = netWorth - purchaseAmount;
+            newYearsToFire = calcYearsToFire(newNetWorth, monthlySavings * 12);
+            savingsRateAfter = monthlyIncome > 0 ? (monthlySavings / monthlyIncome * 100) : 0;
+        }
+
+        const fireDelayMonths = Math.round((newYearsToFire - currentYearsToFire) * 12);
+        const emergencyMonths = monthlyExpenses > 0 ? (parseFloat(p.bank_balance) / monthlyExpenses) : 0;
+        const emergencyAfter = monthlyExpenses > 0 ? ((parseFloat(p.bank_balance) - (isEMI ? 0 : purchaseAmount)) / monthlyExpenses) : 0;
+
+        res.json({
+            purchaseAmount, currentFireYears: currentYearsToFire, newFireYears: newYearsToFire,
+            fireDelayMonths, currentSavingsRate: monthlyIncome > 0 ? (monthlySavings / monthlyIncome * 100) : 0,
+            savingsRateAfter, monthlyEMI, emergencyMonths, emergencyAfter: Math.max(0, emergencyAfter),
+            monthlySavings, newMonthlySavings: isEMI ? monthlySavings - monthlyEMI : monthlySavings,
+            currentAge: parseInt(p.current_age) || 30,
+            projectedAge: (parseInt(p.current_age) || 30) + currentYearsToFire,
+            newProjectedAge: (parseInt(p.current_age) || 30) + newYearsToFire,
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ----- QUICK ADD (simplified expense entry) -----
+app.post('/api/quick-add', authenticateToken, async (req, res) => {
+    try {
+        const { amount, category, description, date } = req.body;
+        if (!amount || !category) return res.status(400).json({ error: 'Amount and category required' });
+
+        let expenseAcc = await pool.query(
+            'SELECT account_id FROM accounts WHERE user_id = $1 AND account_type = $2 AND account_name = $3',
+            [req.user.userId, 'Expense', category]
+        );
+        if (!expenseAcc.rows[0]) {
+            expenseAcc = await pool.query(
+                'INSERT INTO accounts (user_id, account_name, account_type, sub_type) VALUES ($1,$2,$3,$4) RETURNING account_id',
+                [req.user.userId, category, 'Expense', category]
+            );
+        }
+
+        let payAcc = await pool.query(
+            "SELECT account_id FROM accounts WHERE user_id = $1 AND account_type = 'Asset' AND (sub_type ILIKE '%bank%' OR sub_type ILIKE '%cash%' OR account_name ILIKE '%bank%' OR account_name ILIKE '%wallet%') ORDER BY current_balance DESC LIMIT 1",
+            [req.user.userId]
+        );
+        if (!payAcc.rows[0]) {
+            payAcc = await pool.query(
+                'INSERT INTO accounts (user_id, account_name, account_type, sub_type) VALUES ($1,$2,$3,$4) RETURNING account_id',
+                [req.user.userId, 'Cash / Wallet', 'Asset', 'Cash']
+            );
+        }
+
+        const tx = await pool.query(
+            `INSERT INTO transactions (user_id, date, amount, description, debit_account_id, credit_account_id, category)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [req.user.userId, date || new Date().toISOString().split('T')[0], amount, description || category,
+             expenseAcc.rows[0].account_id, payAcc.rows[0].account_id, category]
+        );
+
+        res.json({ success: true, transaction: tx.rows[0], message: `₹${amount} spent on ${category} ✅` });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ----- ASK FI (AI Financial Advisor) -----
+app.post('/api/ask-fi', authenticateToken, async (req, res) => {
+    try {
+        const { message } = req.body;
+        if (!message) return res.status(400).json({ error: 'Message required' });
+
+        const [profileResult, accountsResult, recentTxResult, spendResult] = await Promise.all([
+            pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [req.user.userId]),
+            pool.query('SELECT account_name, account_type, sub_type, current_balance FROM accounts WHERE user_id = $1 ORDER BY account_type, current_balance DESC', [req.user.userId]),
+            pool.query(`SELECT t.date, t.amount, t.description, t.category, da.account_name as debit_to
+                FROM transactions t JOIN accounts da ON t.debit_account_id = da.account_id
+                WHERE t.user_id = $1 ORDER BY t.date DESC LIMIT 30`, [req.user.userId]),
+            pool.query(`SELECT t.category, SUM(t.amount) as total, COUNT(*) as count
+                FROM transactions t JOIN accounts a ON t.debit_account_id = a.account_id
+                WHERE t.user_id = $1 AND a.account_type = 'Expense' AND t.date >= NOW() - INTERVAL '3 months'
+                GROUP BY t.category ORDER BY total DESC`, [req.user.userId])
+        ]);
+
+        const profile = profileResult.rows[0] || {};
+        const accounts = accountsResult.rows;
+        const spendingByCategory = spendResult.rows;
+        const totalAssets = accounts.filter(a => a.account_type === 'Asset').reduce((s, a) => s + parseFloat(a.current_balance || 0), 0);
+        const totalLiabilities = accounts.filter(a => a.account_type === 'Liability').reduce((s, a) => s + parseFloat(a.current_balance || 0), 0);
+        const netWorth = totalAssets - totalLiabilities;
+        const monthlyIncome = parseFloat(profile.monthly_income || 0) + parseFloat(profile.other_income || 0);
+        const monthlyExpenses = parseFloat(profile.monthly_expenses || 0);
+        const monthlySavings = monthlyIncome - monthlyExpenses;
+        const savingsRate = monthlyIncome > 0 ? (monthlySavings / monthlyIncome * 100).toFixed(1) : 0;
+        const fireNumber = (parseFloat(profile.desired_monthly_income || monthlyExpenses * 0.7) * 12) * 25;
+        const fireProgress = fireNumber > 0 ? (netWorth / fireNumber * 100).toFixed(1) : 0;
+        const emergencyMonths = monthlyExpenses > 0 ? (parseFloat(profile.bank_balance || 0) / monthlyExpenses).toFixed(1) : 'N/A';
+
+        const historyResult = await pool.query(
+            'SELECT role, content FROM fi_conversations WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10',
+            [req.user.userId]
+        );
+        const conversationHistory = historyResult.rows.reverse();
+
+        const financialContext = `USER'S FINANCIAL DATA (always use these real numbers):
+NET WORTH: ₹${netWorth.toLocaleString('en-IN')} (Assets: ₹${totalAssets.toLocaleString('en-IN')}, Debts: ₹${totalLiabilities.toLocaleString('en-IN')})
+MONTHLY: Income ₹${monthlyIncome.toLocaleString('en-IN')}, Expenses ₹${monthlyExpenses.toLocaleString('en-IN')}, Savings ₹${monthlySavings.toLocaleString('en-IN')} (${savingsRate}%)
+FIRE: Target ₹${fireNumber.toLocaleString('en-IN')}, Progress ${fireProgress}%, Age ${profile.current_age||30}, Target retirement ${profile.target_retirement_age||45}
+Emergency Fund: ${emergencyMonths} months
+ACCOUNTS: ${accounts.map(a => `${a.account_name}(${a.account_type}): ₹${parseFloat(a.current_balance||0).toLocaleString('en-IN')}`).join(', ')}
+SPENDING (3mo): ${spendingByCategory.map(s => `${s.category}: ₹${parseFloat(s.total).toLocaleString('en-IN')}`).join(', ') || 'No data yet'}`;
+
+        const messages = conversationHistory.map(m => ({ role: m.role, content: m.content }));
+        messages.push({ role: 'user', content: message });
+
+        const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+        if (!ANTHROPIC_API_KEY) {
+            await pool.query('INSERT INTO fi_conversations (user_id, role, content) VALUES ($1, $2, $3)', [req.user.userId, 'user', message]);
+            const fallbackResponse = generateFallbackResponse(message, { netWorth, monthlyIncome, monthlyExpenses, monthlySavings, savingsRate, fireNumber, fireProgress, emergencyMonths, profile, spendingByCategory });
+            await pool.query('INSERT INTO fi_conversations (user_id, role, content) VALUES ($1, $2, $3)', [req.user.userId, 'assistant', fallbackResponse]);
+            return res.json({ response: fallbackResponse, source: 'built-in' });
+        }
+
+        const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-20250514', max_tokens: 1500,
+                system: `You are "Fi", the AI financial advisor inside EnoughFi. Warm, supportive, data-driven.
+RULES: 1) ALWAYS use user's actual data below, never generic advice 2) Calculate FIRE impact for any purchase/decision 3) Use Indian context (₹, 80C/80D, EPF, NPS, PPF, ELSS, ~6% inflation) 4) Use emoji headers, ₹ symbol 5) Be honest kindly 6) Max 300 words 7) End with clear recommendation 8) Simple language, no jargon
+${financialContext}`,
+                messages
+            })
+        });
+        const data = await claudeResponse.json();
+        const fiResponse = data.content?.[0]?.text || 'I need a moment. Could you rephrase?';
+
+        await pool.query('INSERT INTO fi_conversations (user_id, role, content) VALUES ($1, $2, $3)', [req.user.userId, 'user', message]);
+        await pool.query('INSERT INTO fi_conversations (user_id, role, content) VALUES ($1, $2, $3)', [req.user.userId, 'assistant', fiResponse]);
+
+        res.json({ response: fiResponse, source: 'claude' });
+    } catch (error) {
+        console.error('Ask Fi error:', error);
+        res.status(500).json({ error: 'Fi is having trouble right now. Please try again.' });
+    }
+});
+
+app.get('/api/ask-fi/history', authenticateToken, async (req, res) => {
+    try {
+        const messages = await pool.query('SELECT role, content, created_at FROM fi_conversations WHERE user_id = $1 ORDER BY created_at ASC LIMIT 100', [req.user.userId]);
+        res.json(messages.rows);
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.delete('/api/ask-fi/history', authenticateToken, async (req, res) => {
+    try {
+        await pool.query('DELETE FROM fi_conversations WHERE user_id = $1', [req.user.userId]);
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+function generateFallbackResponse(message, data) {
+    const msg = message.toLowerCase();
+    const { netWorth, monthlyIncome, monthlyExpenses, monthlySavings, savingsRate, fireNumber, fireProgress, emergencyMonths, profile, spendingByCategory } = data;
+
+    if (msg.includes('buy') || msg.includes('purchase') || msg.includes('afford') || msg.includes('spend')) {
+        const amountMatch = msg.match(/(\d[\d,]*(?:\.\d+)?)\s*(?:lakh|lac|l)/i) || msg.match(/(\d[\d,]*(?:\.\d+)?)\s*(?:k)/i) || msg.match(/₹?\s*(\d[\d,]*(?:\.\d+)?)/);
+        if (amountMatch) {
+            let amount = parseFloat(amountMatch[1].replace(/,/g, ''));
+            if (msg.includes('lakh') || msg.includes('lac') || msg.match(/\d+\s*l\b/i)) amount *= 100000;
+            if (msg.match(/\d+\s*k\b/i)) amount *= 1000;
+            const monthsOfSavings = monthlySavings > 0 ? (amount / monthlySavings).toFixed(1) : 'N/A';
+            const emergencyAfter = monthlyExpenses > 0 ? ((parseFloat(profile.bank_balance || 0) - amount) / monthlyExpenses).toFixed(1) : 'N/A';
+            const realReturn = 0.0566;
+            const futureValue = amount * Math.pow(1 + realReturn, 10);
+            const fireDelayMonths = monthlySavings > 0 ? Math.round(futureValue / (monthlySavings * 12) * 12) : 0;
+
+            return `📊 ₹${amount.toLocaleString('en-IN')} Purchase Analysis:\n\n💰 This = ${monthsOfSavings} months of your savings\n⏰ FIRE delay: ~${fireDelayMonths} months (₹${Math.round(futureValue).toLocaleString('en-IN')} opportunity cost in 10yr)\n🛡️ Emergency fund after: ${emergencyAfter} months ${parseFloat(emergencyAfter) < 3 ? '⚠️ Risky!' : '✅'}\n\n${parseFloat(emergencyAfter) < 3 ? '🟡 Wait until emergency fund is 6+ months.' : parseFloat(monthsOfSavings) > 3 ? '🟡 Significant purchase. Consider EMI to protect cash reserves.' : '🟢 Manageable! Go for it if it adds value.'}`;
+        }
+    }
+    if (msg.includes('fire') || msg.includes('retire')) {
+        return `🔥 FIRE Status\n\nNet Worth: ₹${netWorth.toLocaleString('en-IN')}\nTarget: ₹${fireNumber.toLocaleString('en-IN')} | Progress: ${fireProgress}%\nSavings Rate: ${savingsRate}%\n\n${parseFloat(savingsRate) >= 50 ? '🚀 Excellent!' : parseFloat(savingsRate) >= 30 ? '👍 Good. Small increases help a lot.' : '📈 Room to improve. Even ₹5K more/month helps significantly.'}`;
+    }
+    if (msg.includes('spending') || msg.includes('expense') || msg.includes('where')) {
+        const cats = spendingByCategory.slice(0, 5).map(s => `${s.category}: ₹${parseFloat(s.total).toLocaleString('en-IN')}`).join('\n  ') || 'Start using Quick Add for insights!';
+        return `📊 Monthly Expenses: ₹${monthlyExpenses.toLocaleString('en-IN')}\nSavings Rate: ${savingsRate}%\n\nTop Categories:\n  ${cats}`;
+    }
+    return `👋 I'm Fi! Your snapshot:\n💰 Net Worth: ₹${netWorth.toLocaleString('en-IN')}\n📈 Savings Rate: ${savingsRate}%\n🔥 FIRE: ${fireProgress}%\n🛡️ Emergency: ${emergencyMonths} months\n\nTry: "Can I buy X for ₹Y?", "When can I retire?", "Where's my money going?"`;
+}
+
 // ===== AUTO-INITIALIZE DATABASE =====
 async function initializeDatabase() {
     try {
@@ -925,7 +1303,56 @@ async function initializeDatabase() {
             try {
                 await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`);
                 await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false`);
+                await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT false`);
             } catch(e) { /* columns may already exist */ }
+
+            // Migration: Create user_profiles table for onboarding data
+            try {
+                await pool.query(`
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        profile_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                        -- What you OWN
+                        bank_balance DECIMAL(15,2) DEFAULT 0,
+                        investments DECIMAL(15,2) DEFAULT 0,
+                        property_value DECIMAL(15,2) DEFAULT 0,
+                        retirement_funds DECIMAL(15,2) DEFAULT 0,
+                        other_assets DECIMAL(15,2) DEFAULT 0,
+                        -- What you OWE
+                        home_loan DECIMAL(15,2) DEFAULT 0,
+                        credit_card_debt DECIMAL(15,2) DEFAULT 0,
+                        other_loans DECIMAL(15,2) DEFAULT 0,
+                        -- What you EARN
+                        monthly_income DECIMAL(15,2) DEFAULT 0,
+                        other_income DECIMAL(15,2) DEFAULT 0,
+                        -- What you SPEND (monthly)
+                        monthly_expenses DECIMAL(15,2) DEFAULT 0,
+                        expense_breakdown JSONB DEFAULT '{}',
+                        -- FIRE dream
+                        target_retirement_age INTEGER DEFAULT 45,
+                        desired_monthly_income DECIMAL(15,2) DEFAULT 0,
+                        current_age INTEGER DEFAULT 30,
+                        -- Metadata
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(user_id)
+                    );
+                `);
+            } catch(e) { console.log('user_profiles migration note:', e.message); }
+
+            // Migration: Create ask_fi_conversations table
+            try {
+                await pool.query(`
+                    CREATE TABLE IF NOT EXISTS fi_conversations (
+                        message_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                        role VARCHAR(20) NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_fi_conv_user ON fi_conversations(user_id, created_at DESC);
+                `);
+            } catch(e) { console.log('fi_conversations migration note:', e.message); }
         }
     } catch (error) {
         console.error('⚠️ Database initialization warning:', error.message);
