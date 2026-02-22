@@ -23,6 +23,9 @@ const PORT = process.env.PORT || 3000;
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 20,                        // max connections in pool
+    idleTimeoutMillis: 30000,       // close idle connections after 30s
+    connectionTimeoutMillis: 5000,  // fail fast if can't connect in 5s
     // Fallback to individual settings if DATABASE_URL not set
     ...(process.env.DATABASE_URL ? {} : {
         host: process.env.DB_HOST,
@@ -532,50 +535,36 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.userId;
 
-        // Account balances by type
-        const balances = await pool.query(
-            `SELECT account_type, SUM(current_balance) as total
-             FROM accounts WHERE user_id = $1 GROUP BY account_type`,
-            [userId]
-        );
-
-        // Monthly income & expenses (last 12 months)
-        const monthly = await pool.query(
-            `SELECT TO_CHAR(t.date, 'YYYY-MM') as month,
-                    SUM(CASE WHEN ca.account_type = 'Income' THEN t.amount ELSE 0 END) as income,
-                    SUM(CASE WHEN da.account_type = 'Expense' THEN t.amount ELSE 0 END) as expenses
-             FROM transactions t
-             LEFT JOIN accounts da ON t.debit_account_id = da.account_id
-             LEFT JOIN accounts ca ON t.credit_account_id = ca.account_id
-             WHERE t.user_id = $1 AND t.date >= NOW() - INTERVAL '12 months'
-             GROUP BY TO_CHAR(t.date, 'YYYY-MM')
-             ORDER BY month DESC`,
-            [userId]
-        );
-
-        // Top spending categories (current month)
-        const topCategories = await pool.query(
-            `SELECT t.category, SUM(t.amount) as total, COUNT(*) as count
-             FROM transactions t
-             JOIN accounts da ON t.debit_account_id = da.account_id
-             WHERE t.user_id = $1 AND da.account_type = 'Expense'
-               AND TO_CHAR(t.date, 'YYYY-MM') = TO_CHAR(NOW(), 'YYYY-MM')
-             GROUP BY t.category ORDER BY total DESC LIMIT 10`,
-            [userId]
-        );
-
-        // Recent transactions
-        const recent = await pool.query(
-            `SELECT t.*, da.account_name as debit_account_name, ca.account_name as credit_account_name
-             FROM transactions t
-             LEFT JOIN accounts da ON t.debit_account_id = da.account_id
-             LEFT JOIN accounts ca ON t.credit_account_id = ca.account_id
-             WHERE t.user_id = $1 ORDER BY t.date DESC, t.created_at DESC LIMIT 10`,
-            [userId]
-        );
-
-        // Transaction count
-        const txCount = await pool.query('SELECT COUNT(*) FROM transactions WHERE user_id = $1', [userId]);
+        // Run ALL queries in parallel instead of sequentially
+        const [balances, monthly, topCategories, recent, txCount] = await Promise.all([
+            pool.query(
+                `SELECT account_type, SUM(current_balance) as total
+                 FROM accounts WHERE user_id = $1 GROUP BY account_type`, [userId]),
+            pool.query(
+                `SELECT TO_CHAR(t.date, 'YYYY-MM') as month,
+                        SUM(CASE WHEN ca.account_type = 'Income' THEN t.amount ELSE 0 END) as income,
+                        SUM(CASE WHEN da.account_type = 'Expense' THEN t.amount ELSE 0 END) as expenses
+                 FROM transactions t
+                 LEFT JOIN accounts da ON t.debit_account_id = da.account_id
+                 LEFT JOIN accounts ca ON t.credit_account_id = ca.account_id
+                 WHERE t.user_id = $1 AND t.date >= NOW() - INTERVAL '12 months'
+                 GROUP BY TO_CHAR(t.date, 'YYYY-MM')
+                 ORDER BY month DESC`, [userId]),
+            pool.query(
+                `SELECT t.category, SUM(t.amount) as total, COUNT(*) as count
+                 FROM transactions t
+                 JOIN accounts da ON t.debit_account_id = da.account_id
+                 WHERE t.user_id = $1 AND da.account_type = 'Expense'
+                   AND TO_CHAR(t.date, 'YYYY-MM') = TO_CHAR(NOW(), 'YYYY-MM')
+                 GROUP BY t.category ORDER BY total DESC LIMIT 10`, [userId]),
+            pool.query(
+                `SELECT t.*, da.account_name as debit_account_name, ca.account_name as credit_account_name
+                 FROM transactions t
+                 LEFT JOIN accounts da ON t.debit_account_id = da.account_id
+                 LEFT JOIN accounts ca ON t.credit_account_id = ca.account_id
+                 WHERE t.user_id = $1 ORDER BY t.date DESC, t.created_at DESC LIMIT 10`, [userId]),
+            pool.query('SELECT COUNT(*) FROM transactions WHERE user_id = $1', [userId])
+        ]);
 
         const balanceMap = {};
         balances.rows.forEach(b => { balanceMap[b.account_type] = parseFloat(b.total); });
@@ -1325,18 +1314,36 @@ async function initializeDatabase() {
                     );
                     CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, date DESC);
                     CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(user_id, category);
+                    CREATE INDEX IF NOT EXISTS idx_tx_debit ON transactions(debit_account_id);
+                    CREATE INDEX IF NOT EXISTS idx_tx_credit ON transactions(credit_account_id);
                     CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
+                    CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(user_id, account_type);
                 `);
                 console.log('✅ Minimal database tables created!');
             }
         } else {
             console.log('✅ Database tables already exist');
-            // Migration: Add is_admin and is_demo columns if they don't exist
+            // Migration: Add columns if they don't exist
             try {
-                await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`);
-                await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false`);
-                await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT false`);
+                await Promise.all([
+                    pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`),
+                    pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN DEFAULT false`),
+                    pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT false`)
+                ]);
             } catch(e) { /* columns may already exist */ }
+
+            // Ensure indexes exist (critical for performance with large datasets)
+            try {
+                await Promise.all([
+                    pool.query(`CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, date DESC)`),
+                    pool.query(`CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(user_id, category)`),
+                    pool.query(`CREATE INDEX IF NOT EXISTS idx_tx_debit ON transactions(debit_account_id)`),
+                    pool.query(`CREATE INDEX IF NOT EXISTS idx_tx_credit ON transactions(credit_account_id)`),
+                    pool.query(`CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id)`),
+                    pool.query(`CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(user_id, account_type)`),
+                ]);
+                console.log('✅ Database indexes verified');
+            } catch(e) { console.log('Index note:', e.message); }
 
             // Migration: Create user_profiles table for onboarding data
             try {
