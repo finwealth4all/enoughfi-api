@@ -865,10 +865,32 @@ app.get('/api/onboarding', authenticateToken, async (req, res) => {
     try {
         const profile = await pool.query('SELECT * FROM user_profiles WHERE user_id = $1', [req.user.userId]);
         const user = await pool.query('SELECT onboarding_complete FROM users WHERE user_id = $1', [req.user.userId]);
+        
+        // Existing users who already have accounts/transactions should not be forced into onboarding
+        let isComplete = user.rows[0]?.onboarding_complete || false;
+        if (!isComplete) {
+            const accountCount = await pool.query('SELECT COUNT(*) FROM accounts WHERE user_id = $1', [req.user.userId]);
+            if (parseInt(accountCount.rows[0].count) > 0) {
+                // This is an existing user with data — mark onboarding complete and skip wizard
+                await pool.query('UPDATE users SET onboarding_complete = true WHERE user_id = $1', [req.user.userId]);
+                isComplete = true;
+            }
+        }
+        
         res.json({
-            complete: user.rows[0]?.onboarding_complete || false,
-            profile: profile.rows[0] || null
+            complete: isComplete,
+            profile: profile.rows[0] || null,
+            hasExistingData: isComplete && !profile.rows[0] // Has accounts but no onboarding profile (v4 user)
         });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/onboarding/skip', authenticateToken, async (req, res) => {
+    try {
+        await pool.query('UPDATE users SET onboarding_complete = true WHERE user_id = $1', [req.user.userId]);
+        res.json({ success: true, message: 'Onboarding skipped' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
