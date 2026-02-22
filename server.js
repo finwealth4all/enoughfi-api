@@ -877,10 +877,14 @@ app.get('/api/onboarding', authenticateToken, async (req, res) => {
 app.post('/api/onboarding', authenticateToken, async (req, res) => {
     try {
         const { bank_balance, investments, property_value, retirement_funds, other_assets,
-                home_loan, credit_card_debt, other_loans,
+                loans_given, home_loan, credit_card_debt, other_loans, loans_from_friends,
                 monthly_income, other_income,
                 monthly_expenses, expense_breakdown,
                 target_retirement_age, desired_monthly_income, current_age } = req.body;
+
+        // Combine new fields into existing columns (no schema change needed)
+        const totalOtherAssets = (parseFloat(other_assets)||0) + (parseFloat(loans_given)||0);
+        const totalOtherLoans = (parseFloat(other_loans)||0) + (parseFloat(loans_from_friends)||0);
 
         await pool.query(`
             INSERT INTO user_profiles (user_id, bank_balance, investments, property_value, retirement_funds, other_assets,
@@ -891,8 +895,8 @@ app.post('/api/onboarding', authenticateToken, async (req, res) => {
                 bank_balance=$2, investments=$3, property_value=$4, retirement_funds=$5, other_assets=$6,
                 home_loan=$7, credit_card_debt=$8, other_loans=$9, monthly_income=$10, other_income=$11,
                 monthly_expenses=$12, expense_breakdown=$13, target_retirement_age=$14, desired_monthly_income=$15, current_age=$16, updated_at=NOW()
-        `, [req.user.userId, bank_balance||0, investments||0, property_value||0, retirement_funds||0, other_assets||0,
-            home_loan||0, credit_card_debt||0, other_loans||0, monthly_income||0, other_income||0,
+        `, [req.user.userId, bank_balance||0, investments||0, property_value||0, retirement_funds||0, totalOtherAssets,
+            home_loan||0, credit_card_debt||0, totalOtherLoans, monthly_income||0, other_income||0,
             monthly_expenses||0, JSON.stringify(expense_breakdown||{}), target_retirement_age||45, desired_monthly_income||0, current_age||30]);
 
         await pool.query('UPDATE users SET onboarding_complete = true WHERE user_id = $1', [req.user.userId]);
@@ -905,20 +909,26 @@ app.post('/api/onboarding', authenticateToken, async (req, res) => {
                 { name: 'Investments', type: 'Asset', sub: 'Investment', balance: investments||0 },
                 { name: 'Property', type: 'Asset', sub: 'Fixed Asset', balance: property_value||0 },
                 { name: 'Retirement (EPF/PPF/NPS)', type: 'Asset', sub: 'Retirement', balance: retirement_funds||0 },
+                { name: 'Loan Given to Others', type: 'Asset', sub: 'Receivable', balance: loans_given||0 },
                 { name: 'Other Assets', type: 'Asset', sub: 'Other', balance: other_assets||0 },
                 { name: 'Home Loan', type: 'Liability', sub: 'Loan', balance: home_loan||0 },
                 { name: 'Credit Card', type: 'Liability', sub: 'Credit Card', balance: credit_card_debt||0 },
                 { name: 'Other Loans', type: 'Liability', sub: 'Loan', balance: other_loans||0 },
+                { name: 'Borrowed from Friends/Family', type: 'Liability', sub: 'Personal Loan', balance: loans_from_friends||0 },
                 { name: 'Salary', type: 'Income', sub: 'Salary', balance: 0 },
                 { name: 'Other Income', type: 'Income', sub: 'Other', balance: 0 },
                 { name: 'Cash / Wallet', type: 'Asset', sub: 'Cash', balance: 0 },
             ];
-            const defaultExpenseCategories = ['Rent/EMI', 'Groceries', 'Utilities', 'Transport', 'Dining Out', 'Shopping', 'Health', 'Entertainment', 'Travel', 'Other Expenses'];
+            const defaultExpenseCategories = [
+                'Rent/EMI', 'Groceries', 'Utilities', 'Transport', 'Dining Out', 'Shopping',
+                'Health', 'Education', 'SIP/Investments', 'Sending to Family',
+                'Entertainment', 'Travel', 'Other Expenses'
+            ];
             for (const cat of defaultExpenseCategories) {
                 basicAccounts.push({ name: cat, type: 'Expense', sub: cat, balance: 0 });
             }
             for (const acc of basicAccounts) {
-                if (acc.type === 'Liability' && acc.balance === 0) continue;
+                if ((acc.type === 'Liability' || acc.sub === 'Receivable') && acc.balance === 0) continue;
                 try {
                     await pool.query(`INSERT INTO accounts (user_id, account_name, account_type, sub_type, current_balance) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
                         [req.user.userId, acc.name, acc.type, acc.sub, acc.balance]);
